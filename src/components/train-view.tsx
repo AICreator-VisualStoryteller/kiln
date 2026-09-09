@@ -1,0 +1,479 @@
+import { useMemo, useState } from "react";
+import { Link } from "@tanstack/react-router";
+import { Square, Zap } from "lucide-react";
+import { toast } from "sonner";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip as ReTooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
+import { Slider } from "@/components/ui/slider";
+import { useKiln } from "@/lib/store";
+import { requestStop, startTrainJob, trainReadiness } from "@/lib/ml/job";
+import { pingNode, pingRemote } from "@/lib/ml/remote";
+import type { ComputeMode, ImageSize } from "@/lib/types";
+import { BATCH_SIZES, IMAGE_SIZES, maxBatchFor } from "@/lib/types";
+import { cn, formatBytes, formatLoss } from "@/lib/utils";
+
+const LR_STEPS = [0.0005, 0.001, 0.002];
+
+export function TrainView() {
+  const config = useKiln((s) => s.config);
+  const setConfig = useKiln((s) => s.setConfig);
+  const compute = useKiln((s) => s.compute);
+  const setCompute = useKiln((s) => s.setCompute);
+  const status = useKiln((s) => s.status);
+  const logs = useKiln((s) => s.logs);
+  const trainMessage = useKiln((s) => s.trainMessage);
+  const consoleLines = useKiln((s) => s.consoleLines);
+  const jobId = useKiln((s) => s.jobId);
+  const prepDone = useKiln((s) => s.prepDone);
+  const prepTotal = useKiln((s) => s.prepTotal);
+  const modelInfo = useKiln((s) => s.modelInfo);
+  const modelStale = useKiln((s) => s.modelStale);
+  const images = useKiln((s) => s.images);
+  const ready = useKiln((s) => s.ready);
+  const [busy, setBusy] = useState(false);
+  const [pingMsg, setPingMsg] = useState<string | null>(null);
+
+  const check = trainReadiness();
+  const running = status === "running" || status === "loading";
+  const last = logs[logs.length - 1];
+  const progress =
+    running && prepTotal > 0
+      ? Math.round((prepDone / prepTotal) * 100)
+      : running && config.epochs > 0
+        ? Math.round(((last?.epoch ?? 0) / config.epochs) * 100)
+        : status === "done"
+          ? 100
+          : 0;
+
+  const chartData = useMemo(
+    () => logs.map((l) => ({ epoch: l.epoch, loss: Number(l.loss.toFixed(4)) })),
+    [logs],
+  );
+
+  async function onStart() {
+    setBusy(true);
+    try {
+      await startTrainJob();
+      toast.success("Training voltooid");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Training mislukt");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onPing() {
+    setPingMsg("testen…");
+    try {
+      if (compute.mode === "local") {
+        setPingMsg("lokaal — geen ping nodig");
+      } else if (compute.remoteUrl.trim()) {
+        const h = await pingRemote(compute.remoteUrl, compute.remoteToken);
+        setPingMsg(`${h.name} · ${h.backend} · ${h.renderer}`);
+      } else {
+        const h = await pingNode();
+        setPingMsg(`${h.name} · ${h.backend} · ${h.renderer}`);
+      }
+    } catch (err) {
+      setPingMsg(err instanceof Error ? err.message : "geen verbinding");
+    }
+  }
+
+  if (!ready) {
+    return <p className="text-sm text-muted-foreground">Studio laden…</p>;
+  }
+
+  return (
+    <div className="mx-auto max-w-6xl space-y-8">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-medium tracking-tight">Training</h1>
+          <p className="mt-1 max-w-xl text-sm text-muted-foreground">
+            Een conditioneel DDPM. Het U-Net voorspelt het schone beeld (niet de
+            ruis), geconditioneerd op jouw bijschriften. Echte backpropagation.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {running ? (
+            <Button variant="secondary" onClick={requestStop} disabled={compute.mode !== "local"}>
+              <Square className="size-4" />
+              Stop
+            </Button>
+          ) : (
+            <Button onClick={() => void onStart()} disabled={!check.ok || busy}>
+              <Zap className="size-4" />
+              {modelInfo ? "Opnieuw trainen" : "Job starten"}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <GpuNode jobId={jobId} />
+
+      <section className="space-y-4 rounded-xl bg-surface p-5 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
+        <h2 className="text-sm font-medium">Compute</h2>
+        <div className="flex flex-wrap gap-2">
+          {(
+            [
+              ["local", "Lokaal (deze browser)"],
+              ["remote", "GPU-server"],
+            ] as [ComputeMode, string][]
+          ).map(([mode, label]) => (
+            <button
+              key={mode}
+              type="button"
+              disabled={running}
+              onClick={() => void setCompute({ mode })}
+              className={cn(
+                "h-11 rounded-md px-3 text-sm",
+                compute.mode === mode || (mode === "remote" && compute.mode === "node")
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-elevated text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {compute.mode === "local" ? (
+          <p className="text-xs text-muted-foreground">
+            Training draait hier, op de WebGL-GPU van dit apparaat. Echte
+            backpropagation — aanbevolen.
+          </p>
+        ) : null}
+        {compute.mode === "remote" || compute.mode === "node" ? (
+          <div className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              Leeg = deze Kiln-node (<span className="font-mono">/api/gpu</span>
+              ). Of plak de URL van een eigen node: GET /health, POST /train.
+            </p>
+            <Input
+              value={compute.remoteUrl}
+              disabled={running}
+              placeholder="http://127.0.0.1:8765"
+              onChange={(e) => void setCompute({ remoteUrl: e.target.value })}
+            />
+            <Input
+              value={compute.remoteToken}
+              disabled={running}
+              placeholder="Bearer-token (optioneel)"
+              onChange={(e) => void setCompute({ remoteToken: e.target.value })}
+            />
+          </div>
+        ) : null}
+        {compute.mode !== "local" ? (
+          <div className="flex flex-wrap items-center gap-3">
+            <Button variant="secondary" size="sm" onClick={() => void onPing()} disabled={running}>
+              Test verbinding
+            </Button>
+            {pingMsg ? (
+              <p className="font-mono text-xs text-muted-foreground">{pingMsg}</p>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
+
+      {running ? (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-muted-foreground">{trainMessage}</p>
+            <p className="font-mono text-xs tabular-nums text-muted-foreground">
+              {last ? `epoch ${last.epoch}/${config.epochs}` : "voorbereiden"}
+            </p>
+          </div>
+          <Progress value={progress} />
+        </div>
+      ) : trainMessage && status === "error" ? (
+        <p className="text-sm text-destructive">{trainMessage}</p>
+      ) : null}
+
+      {!check.ok ? (
+        <div className="rounded-xl bg-surface px-6 py-8 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
+          <h2 className="text-base font-medium">Nog niet klaar om te trainen</h2>
+          <p className="mt-2 text-sm text-muted-foreground">{check.reason}</p>
+          <Button asChild className="mt-5" variant="secondary">
+            <Link to="/">Naar dataset</Link>
+          </Button>
+        </div>
+      ) : null}
+
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,18rem)_minmax(0,1fr)]">
+        <section className="space-y-6 rounded-xl bg-surface p-5 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
+          <h2 className="text-sm font-medium">DDPM-config</h2>
+          <Field label="Epochs" value={String(config.epochs)}>
+            <Slider
+              min={16}
+              max={80}
+              step={1}
+              value={[config.epochs]}
+              disabled={running}
+              onValueChange={([v]) => void setConfig({ epochs: v ?? 40 })}
+            />
+          </Field>
+          <Field label="Leer-tempo" value={String(config.learningRate)}>
+            <ChipRow
+              disabled={running}
+              options={LR_STEPS.map((v) => ({ value: String(v), label: String(v) }))}
+              current={String(config.learningRate)}
+              onPick={(v) => void setConfig({ learningRate: Number(v) })}
+            />
+          </Field>
+          <Field label="Beeldmaat" value={`${config.imageSize}px`}>
+            <ChipRow
+              disabled={running}
+              options={IMAGE_SIZES.map((v) => ({ value: String(v), label: String(v) }))}
+              current={String(config.imageSize)}
+              onPick={(v) => void setConfig({ imageSize: Number(v) as ImageSize })}
+            />
+          </Field>
+          {config.imageSize >= 128 ? (
+            <p className="text-xs text-muted-foreground">
+              {config.imageSize}px is zwaar — lokaal op GPU, kleine batch. Bij 512px max{" "}
+              {maxBatchFor(512)} tegelijk.
+            </p>
+          ) : null}
+          <Field label="Timesteps T" value={String(config.timesteps)}>
+            <ChipRow
+              disabled={running}
+              options={[
+                { value: "12", label: "12" },
+                { value: "20", label: "20" },
+                { value: "40", label: "40" },
+              ]}
+              current={String(config.timesteps)}
+              onPick={(v) => void setConfig({ timesteps: Number(v) })}
+            />
+          </Field>
+          <Field label="Batch" value={String(config.batchSize)}>
+            <ChipRow
+              disabled={running}
+              options={BATCH_SIZES.map((v) => ({
+                value: String(v),
+                label: String(v),
+              }))}
+              current={String(config.batchSize)}
+              onPick={(v) => void setConfig({ batchSize: Number(v) })}
+            />
+          </Field>
+          <p className="font-mono text-xs text-muted-foreground">
+            {images.filter((im) => im.caption.trim()).length} gelabelde beelden
+          </p>
+          <ArchitectureTiny />
+        </section>
+
+        <section className="space-y-6">
+          {consoleLines.length > 0 ? (
+            <div className="rounded-xl bg-surface p-5 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
+              <h2 className="mb-3 text-sm font-medium">Node-console</h2>
+              <pre className="max-h-40 overflow-auto font-mono text-micro leading-relaxed text-muted-foreground">
+                {consoleLines.map((line, i) => (
+                  <div key={`${i}-${line}`}>{line}</div>
+                ))}
+              </pre>
+            </div>
+          ) : null}
+
+          <div className="rounded-xl bg-surface p-5 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-sm font-medium">Noise-prediction loss</h2>
+              {last ? (
+                <p className="font-mono text-xs tabular-nums text-muted-foreground">
+                  mse {formatLoss(last.loss)}
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground">wacht op epochs</p>
+              )}
+            </div>
+            <div className="h-56">
+              {chartData.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke="color-mix(in oklab, var(--color-foreground) 8%, transparent)" />
+                    <XAxis
+                      dataKey="epoch"
+                      tick={{ fill: "var(--color-muted-foreground)", fontSize: 11 }}
+                      axisLine={false}
+                      tickLine={false}
+                    />
+                    <YAxis
+                      tick={{ fill: "var(--color-muted-foreground)", fontSize: 11 }}
+                      axisLine={false}
+                      tickLine={false}
+                      width={40}
+                    />
+                    <ReTooltip
+                      contentStyle={{
+                        background: "var(--color-elevated)",
+                        border: "1px solid var(--color-border)",
+                        borderRadius: 8,
+                        fontSize: 12,
+                      }}
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="loss"
+                      stroke="var(--color-accent)"
+                      dot={false}
+                      strokeWidth={1.75}
+                      isAnimationActive={false}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="lab-grid flex h-full items-center justify-center rounded-lg">
+                  <p className="text-sm text-muted-foreground">Start een job om de curve te zien</p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {modelInfo ? (
+            <div className="rounded-xl bg-surface p-5 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
+              <div className="mb-3 flex items-center gap-2">
+                <h2 className="text-sm font-medium">Getraind DDPM</h2>
+                <Badge variant={modelStale ? "warning" : "success"}>
+                  {modelStale ? "verouderd t.o.v. data" : "klaar"}
+                </Badge>
+              </div>
+              <dl className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+                <Stat k="Parameters" v={modelInfo.params.toLocaleString("nl-NL")} />
+                <Stat k="Loss" v={formatLoss(modelInfo.finalLoss)} />
+                <Stat k="Backend" v={modelInfo.backend} />
+                <Stat k="Compute" v={modelInfo.compute} />
+              </dl>
+              <Button asChild variant="secondary" className="mt-4">
+                <Link to="/lab">Beelden genereren</Link>
+              </Button>
+            </div>
+          ) : null}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function GpuNode({ jobId }: { jobId: string | null }) {
+  const gpu = useKiln((s) => s.gpu);
+  const status = useKiln((s) => s.status);
+  const compute = useKiln((s) => s.compute);
+  const live = status === "running" || status === "loading";
+  const name =
+    compute.mode === "local"
+      ? "kiln-gpu-0"
+      : compute.remoteUrl.trim()
+        ? "remote-gpu"
+        : "kiln-node-0";
+  return (
+    <div className="flex flex-col gap-3 rounded-xl bg-surface p-4 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)] sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex items-center gap-3">
+        <span
+          className={cn(
+            "size-2 rounded-full",
+            live ? "gpu-live bg-accent" : "bg-muted-foreground/40",
+          )}
+        />
+        <div>
+          <p className="text-sm font-medium">{name}</p>
+          <p className="max-w-md truncate text-xs text-muted-foreground">
+            {gpu?.renderer ?? "GPU detecteren…"}
+          </p>
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-x-5 gap-y-1 font-mono text-xs tabular-nums text-muted-foreground">
+        <span>backend {gpu?.backend ?? "—"}</span>
+        <span>tensors {gpu?.numTensors ?? 0}</span>
+        <span>{formatBytes(gpu?.numBytes ?? 0)}</span>
+        <span>{jobId ?? "idle"}</span>
+      </div>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  children,
+}: {
+  label: string;
+  value: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-muted-foreground">{label}</p>
+        <p className="font-mono text-xs tabular-nums">{value}</p>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function ChipRow({
+  options,
+  current,
+  onPick,
+  disabled,
+}: {
+  options: { value: string; label: string }[];
+  current: string;
+  onPick: (value: string) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {options.map((opt) => (
+        <button
+          key={opt.value}
+          type="button"
+          disabled={disabled}
+          onClick={() => onPick(opt.value)}
+          className={cn(
+            "h-9 rounded-md px-2.5 text-xs transition-colors duration-150",
+            current === opt.value
+              ? "bg-primary text-primary-foreground"
+              : "bg-elevated text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ArchitectureTiny() {
+  const layers = ["x", "enc", "down×3", "bot", "up×3", "x0"];
+  return (
+    <div className="flex flex-wrap gap-1">
+      {layers.map((name) => (
+        <span
+          key={name}
+          className="rounded-md bg-elevated px-2 py-1 font-mono text-xs text-muted-foreground"
+        >
+          {name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function Stat({ k, v }: { k: string; v: string }) {
+  return (
+    <div>
+      <dt className="text-xs text-muted-foreground">{k}</dt>
+      <dd className="mt-0.5 font-mono text-sm tabular-nums">{v}</dd>
+    </div>
+  );
+}

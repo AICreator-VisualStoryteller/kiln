@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Kiln",
+      "hasCanvas": false,
+      "bodyTextLen": 482,
+      "bodyTextHash": "ace1f3e9034c2c67fad66f3e014b35bf2952339478aa07aa1152371029ca342b",
+      "bodyTextPrefix": "Kiln text → image Data Trainen Genereren Beelden 0 Model leeg Co",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Kiln",
+      "hasCanvas": false,
+      "bodyTextLen": 417,
+      "bodyTextHash": "b5b71c6d8e762f29667d3cfbef41acf0c4438915930835ac2ed03b80b6b60c38",
+      "bodyTextPrefix": "GPU-node detecteren… Dataset Elke afbeelding krijgt een bijschri",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}
