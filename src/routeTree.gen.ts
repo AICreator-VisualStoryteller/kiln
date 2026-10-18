@@ -11,8 +11,11 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as StudioRouteImport } from './routes/_studio'
 import { Route as StudioIndexRouteImport } from './routes/_studio/index'
+import { Route as StudioGalleryRouteImport } from './routes/_studio/gallery'
 import { Route as StudioLabRouteImport } from './routes/_studio/lab'
 import { Route as StudioTrainRouteImport } from './routes/_studio/train'
+import { Route as ApiFacesPackRouteImport } from './routes/api/faces-pack'
+import { Route as ApiFruitPackRouteImport } from './routes/api/fruit-pack'
 import { Route as ApiMediaRouteImport } from './routes/api/media'
 import { Route as ApiGpuHealthRouteImport } from './routes/api/gpu/health'
 import { Route as ApiGpuTrainRouteImport } from './routes/api/gpu/train'
@@ -26,6 +29,11 @@ const StudioIndexRoute = StudioIndexRouteImport.update({
   path: '/',
   getParentRoute: () => StudioRoute,
 } as any)
+const StudioGalleryRoute = StudioGalleryRouteImport.update({
+  id: '/gallery',
+  path: '/gallery',
+  getParentRoute: () => StudioRoute,
+} as any)
 const StudioLabRoute = StudioLabRouteImport.update({
   id: '/lab',
   path: '/lab',
@@ -35,6 +43,16 @@ const StudioTrainRoute = StudioTrainRouteImport.update({
   id: '/train',
   path: '/train',
   getParentRoute: () => StudioRoute,
+} as any)
+const ApiFacesPackRoute = ApiFacesPackRouteImport.update({
+  id: '/api/faces-pack',
+  path: '/api/faces-pack',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiFruitPackRoute = ApiFruitPackRouteImport.update({
+  id: '/api/fruit-pack',
+  path: '/api/fruit-pack',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const ApiMediaRoute = ApiMediaRouteImport.update({
   id: '/api/media',
@@ -54,15 +72,21 @@ const ApiGpuTrainRoute = ApiGpuTrainRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof StudioIndexRoute
+  '/gallery': typeof StudioGalleryRoute
   '/lab': typeof StudioLabRoute
   '/train': typeof StudioTrainRoute
+  '/api/faces-pack': typeof ApiFacesPackRoute
+  '/api/fruit-pack': typeof ApiFruitPackRoute
   '/api/media': typeof ApiMediaRoute
   '/api/gpu/health': typeof ApiGpuHealthRoute
   '/api/gpu/train': typeof ApiGpuTrainRoute
 }
 export interface FileRoutesByTo {
+  '/gallery': typeof StudioGalleryRoute
   '/lab': typeof StudioLabRoute
   '/train': typeof StudioTrainRoute
+  '/api/faces-pack': typeof ApiFacesPackRoute
+  '/api/fruit-pack': typeof ApiFruitPackRoute
   '/api/media': typeof ApiMediaRoute
   '/': typeof StudioIndexRoute
   '/api/gpu/health': typeof ApiGpuHealthRoute
@@ -71,8 +95,11 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_studio': typeof StudioRouteWithChildren
+  '/_studio/gallery': typeof StudioGalleryRoute
   '/_studio/lab': typeof StudioLabRoute
   '/_studio/train': typeof StudioTrainRoute
+  '/api/faces-pack': typeof ApiFacesPackRoute
+  '/api/fruit-pack': typeof ApiFruitPackRoute
   '/api/media': typeof ApiMediaRoute
   '/_studio/': typeof StudioIndexRoute
   '/api/gpu/health': typeof ApiGpuHealthRoute
@@ -82,15 +109,21 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/gallery'
     | '/lab'
     | '/train'
+    | '/api/faces-pack'
+    | '/api/fruit-pack'
     | '/api/media'
     | '/api/gpu/health'
     | '/api/gpu/train'
   fileRoutesByTo: FileRoutesByTo
   to:
+    | '/gallery'
     | '/lab'
     | '/train'
+    | '/api/faces-pack'
+    | '/api/fruit-pack'
     | '/api/media'
     | '/'
     | '/api/gpu/health'
@@ -98,8 +131,11 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/_studio'
+    | '/_studio/gallery'
     | '/_studio/lab'
     | '/_studio/train'
+    | '/api/faces-pack'
+    | '/api/fruit-pack'
     | '/api/media'
     | '/_studio/'
     | '/api/gpu/health'
@@ -108,6 +144,8 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   StudioRoute: typeof StudioRouteWithChildren
+  ApiFacesPackRoute: typeof ApiFacesPackRoute
+  ApiFruitPackRoute: typeof ApiFruitPackRoute
   ApiMediaRoute: typeof ApiMediaRoute
   ApiGpuHealthRoute: typeof ApiGpuHealthRoute
   ApiGpuTrainRoute: typeof ApiGpuTrainRoute
@@ -129,6 +167,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof StudioIndexRouteImport
       parentRoute: typeof StudioRoute
     }
+    '/_studio/gallery': {
+      id: '/_studio/gallery'
+      path: '/gallery'
+      fullPath: '/gallery'
+      preLoaderRoute: typeof StudioGalleryRouteImport
+      parentRoute: typeof StudioRoute
+    }
     '/_studio/lab': {
       id: '/_studio/lab'
       path: '/lab'
@@ -142,6 +187,20 @@ declare module '@tanstack/react-router' {
       fullPath: '/train'
       preLoaderRoute: typeof StudioTrainRouteImport
       parentRoute: typeof StudioRoute
+    }
+    '/api/faces-pack': {
+      id: '/api/faces-pack'
+      path: '/api/faces-pack'
+      fullPath: '/api/faces-pack'
+      preLoaderRoute: typeof ApiFacesPackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/fruit-pack': {
+      id: '/api/fruit-pack'
+      path: '/api/fruit-pack'
+      fullPath: '/api/fruit-pack'
+      preLoaderRoute: typeof ApiFruitPackRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/api/media': {
       id: '/api/media'
@@ -168,12 +227,14 @@ declare module '@tanstack/react-router' {
 }
 
 interface StudioRouteChildren {
+  StudioGalleryRoute: typeof StudioGalleryRoute
   StudioLabRoute: typeof StudioLabRoute
   StudioTrainRoute: typeof StudioTrainRoute
   StudioIndexRoute: typeof StudioIndexRoute
 }
 
 const StudioRouteChildren: StudioRouteChildren = {
+  StudioGalleryRoute: StudioGalleryRoute,
   StudioLabRoute: StudioLabRoute,
   StudioTrainRoute: StudioTrainRoute,
   StudioIndexRoute: StudioIndexRoute,
@@ -184,6 +245,8 @@ const StudioRouteWithChildren =
 
 const rootRouteChildren: RootRouteChildren = {
   StudioRoute: StudioRouteWithChildren,
+  ApiFacesPackRoute: ApiFacesPackRoute,
+  ApiFruitPackRoute: ApiFruitPackRoute,
   ApiMediaRoute: ApiMediaRoute,
   ApiGpuHealthRoute: ApiGpuHealthRoute,
   ApiGpuTrainRoute: ApiGpuTrainRoute,

@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { Camera, Images, PawPrint, Pencil, Trash2, Upload, Shapes, Zap } from "lucide-react";
+import { Apple, Camera, Images, PawPrint, Pencil, ScanFace, Trash2, Upload, Shapes, Zap } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +18,8 @@ import { useKiln } from "@/lib/store";
 import { fileToStoredBlob } from "@/lib/image";
 import { generateSampleSet } from "@/lib/ml/sample";
 import { loadPetDataset } from "@/lib/ml/pets";
+import { FRUIT_LEGEND, FRUIT_TOTAL, isFruitCode, loadFruitDataset } from "@/lib/ml/fruit";
+import { FACE_TOTAL, isFaceCaption, loadFaceDataset } from "@/lib/ml/faces";
 import { trainReadiness } from "@/lib/ml/job";
 import { parseLabels } from "@/lib/tags";
 import { cn } from "@/lib/utils";
@@ -37,8 +39,11 @@ export function DatasetView() {
   const [caption, setCaption] = useState("");
   const [busy, setBusy] = useState(false);
   const [drag, setDrag] = useState(false);
-  const [petProgress, setPetProgress] = useState<{ done: number; total: number } | null>(null);
+  const [packProgress, setPackProgress] = useState<{ done: number; total: number } | null>(null);
   const galleryRef = useRef<HTMLInputElement>(null);
+
+  const fruitCount = images.filter((im) => isFruitCode(im.caption)).length;
+  const faceCount = images.filter((im) => isFaceCaption(im.caption)).length;
 
   const ingest = useCallback(
     async (fileList: FileList | File[]) => {
@@ -61,7 +66,7 @@ export function DatasetView() {
         toast.success(
           cap
             ? `${packed.length} beeld${packed.length === 1 ? "" : "en"} · ${parseLabels(cap).length} labels`
-            : `${packed.length} beeld${packed.length === 1 ? "" : "en"} — voeg nog labels toe`,
+            : `${packed.length} beeld${packed.length === 1 ? "" : "en"} — labels optioneel, klaar om te trainen`,
         );
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Upload mislukt");
@@ -89,10 +94,10 @@ export function DatasetView() {
 
   async function onPets() {
     setBusy(true);
-    setPetProgress({ done: 0, total: 300 });
+    setPackProgress({ done: 0, total: 300 });
     try {
       const samples = await loadPetDataset({
-        onProgress: (done, total) => setPetProgress({ done, total }),
+        onProgress: (done, total) => setPackProgress({ done, total }),
       });
       await addImages(samples);
       toast.success(`${samples.length} honden- en kattenfoto’s met multi-labels`);
@@ -100,7 +105,49 @@ export function DatasetView() {
       toast.error(err instanceof Error ? err.message : "Dataset laden mislukt");
     } finally {
       setBusy(false);
-      setPetProgress(null);
+      setPackProgress(null);
+    }
+  }
+
+  async function onFruit() {
+    setBusy(true);
+    setPackProgress({ done: 0, total: FRUIT_TOTAL });
+    try {
+      const samples = await loadFruitDataset({
+        onProgress: (done, total) => setPackProgress({ done, total }),
+      });
+      const chunk = 32;
+      for (let i = 0; i < samples.length; i += chunk) {
+        await addImages(samples.slice(i, i + chunk));
+        setPackProgress({ done: Math.min(samples.length, i + chunk), total: samples.length });
+      }
+      toast.success(`${samples.length} fruitfoto’s · één label per groep`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Fruitdataset laden mislukt");
+    } finally {
+      setBusy(false);
+      setPackProgress(null);
+    }
+  }
+
+  async function onFaces() {
+    setBusy(true);
+    setPackProgress({ done: 0, total: FACE_TOTAL });
+    try {
+      const samples = await loadFaceDataset({
+        onProgress: (done, total) => setPackProgress({ done, total }),
+      });
+      const chunk = 40;
+      for (let i = 0; i < samples.length; i += chunk) {
+        await addImages(samples.slice(i, i + chunk));
+        setPackProgress({ done: Math.min(samples.length, i + chunk), total: samples.length });
+      }
+      toast.success(`${samples.length} gezichten met korte Engelse labels`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Gezichten laden mislukt");
+    } finally {
+      setBusy(false);
+      setPackProgress(null);
     }
   }
 
@@ -117,8 +164,8 @@ export function DatasetView() {
         <div>
           <h1 className="text-2xl font-medium tracking-tight">Dataset</h1>
           <p className="mt-1 max-w-xl text-sm text-muted-foreground">
-            Foto’s uit je galerij, camera of een kant-en-klare set. Elke afbeelding
-            krijgt meerdere labels — daarop traint het diffusion-model.
+            Foto’s uit je galerij, camera of een kant-en-klare set. Labels zijn
+            optioneel — zonder labels traint het model ongeconditioneerd.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -130,23 +177,34 @@ export function DatasetView() {
             <PawPrint className="size-4" />
             Honden & katten
           </Button>
+          <Button variant="secondary" onClick={() => void onFruit()} disabled={busy}>
+            <Apple className="size-4" />
+            Fruit
+          </Button>
+          <Button variant="secondary" onClick={() => void onFaces()} disabled={busy}>
+            <ScanFace className="size-4" />
+            Gezichten
+          </Button>
         </div>
       </div>
 
-      {petProgress ? (
+      {packProgress ? (
         <div className="space-y-2 rounded-xl bg-surface p-4 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
           <p className="text-sm">
-            Foto’s laden… {petProgress.done}/{petProgress.total}
+            Foto’s laden… {packProgress.done}/{packProgress.total}
           </p>
           <Progress
-            value={petProgress.total ? Math.round((petProgress.done / petProgress.total) * 100) : 0}
+            value={packProgress.total ? Math.round((packProgress.done / packProgress.total) * 100) : 0}
           />
         </div>
       ) : null}
 
       {check.ok && !modelInfo ? (
         <div className="flex flex-col gap-3 rounded-xl bg-surface p-4 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)] sm:flex-row sm:items-center sm:justify-between">
-          <p className="text-sm">{check.n} gelabelde beelden — klaar om te trainen.</p>
+          <p className="text-sm">
+            {check.n} beelden{check.labeled ? ` · ${check.labeled} gelabeld` : " zonder labels"} —
+            klaar om te trainen.
+          </p>
           <Button asChild>
             <Link to="/train">
               <Zap className="size-4" />
@@ -211,8 +269,24 @@ export function DatasetView() {
         />
       </div>
 
+      {fruitCount > 0 ? (
+        <div className="rounded-xl bg-surface p-4 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
+          <p className="text-sm font-medium">Fruitlabels — één code per groep</p>
+          <ul className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {FRUIT_LEGEND.map((g) => (
+              <li key={g.code} className="flex items-center gap-2 text-xs">
+                <span className="inline-flex h-7 min-w-8 items-center justify-center rounded-md bg-elevated px-2 font-mono text-xs">
+                  {g.code}
+                </span>
+                <span className="text-muted-foreground">{g.name}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
       {images.length === 0 ? (
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-4 sm:grid-cols-3">
           <div className="rounded-xl bg-surface px-6 py-8 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
             <h2 className="text-base font-medium">Vormen</h2>
             <p className="mt-2 text-sm text-muted-foreground">
@@ -235,13 +309,24 @@ export function DatasetView() {
               300 foto’s laden
             </Button>
           </div>
+          <div className="rounded-xl bg-surface px-6 py-8 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_10%,transparent)]">
+            <h2 className="text-base font-medium">Fruit</h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              126 echte foto’s. Elke groep één label: A, AB, G, GB, S, SB, P, PB, C, CB.
+            </p>
+            <Button className="mt-5" onClick={() => void onFruit()} disabled={busy}>
+              <Apple className="size-4" />
+              126 foto’s laden
+            </Button>
+          </div>
         </div>
       ) : (
         <>
           <div className="flex items-center justify-between gap-3">
             <p className="text-xs text-muted-foreground">
               {images.length} beelden
-              {unlabeled ? ` · ${unlabeled} zonder labels` : ""} · multi-labels = trainingsconditie
+              {unlabeled ? ` · ${unlabeled} zonder labels` : ""}
+              {fruitCount ? " · fruitcodes als conditie" : " · labels = trainingsconditie"}
             </p>
             <Button variant="ghost" size="sm" onClick={() => setResetOpen(true)}>
               <Trash2 className="size-3.5" />

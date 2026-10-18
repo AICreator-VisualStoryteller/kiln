@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import type { EpochLog, ModelInfo, TrainConfig, WeightDump } from "@/lib/types";
+import { clampTrainConfig } from "@/lib/types";
 import { rgbToU8, u8ToB64, b64ToU8, u8ToRgb } from "./codec.ts";
 import type { RgbSample } from "./diffusion.ts";
 
@@ -114,13 +115,9 @@ export const gpuTrain = createServerFn({ method: "POST" })
     const { trainDiffusion } = await import("./diffusion");
     const samples = unpack(data.samples);
     const logs: EpochLog[] = [];
-    const capped: typeof data.config = {
-      ...data.config,
-      epochs: Math.min(data.config.epochs, 40),
-    };
     const result = await trainDiffusion({
       samples,
-      config: capped,
+      config: clampTrainConfig(data.config),
       onEpoch: (log) => logs.push(log),
       onStatus: () => undefined,
     });

@@ -21,10 +21,7 @@ export const Route = createFileRoute("/api/gpu/train")({
         const { trainDiffusion } = await import("@/lib/ml/diffusion");
         const samples = unpack(body.samples);
         const logs: { epoch: number; loss: number; seconds: number }[] = [];
-        const config = clampTrainConfig({
-          ...body.config,
-          epochs: Math.min(Number(body.config.epochs) || 12, 40),
-        });
+        const config = clampTrainConfig(body.config);
         const result = await trainDiffusion({
           samples,
           config,

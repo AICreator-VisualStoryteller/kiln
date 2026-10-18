@@ -2,16 +2,21 @@ import { create } from "zustand";
 import type {
   ComputeSettings,
   EpochLog,
+  GalleryRecord,
   GpuInfo,
   ImageRecord,
   ModelInfo,
+  ProofShot,
   TrainConfig,
   TrainStatus,
+  WeightDump,
 } from "./types";
-import { DEFAULT_COMPUTE, DEFAULT_TRAIN_CONFIG, clampTrainConfig } from "./types";
+import { DEFAULT_COMPUTE, DEFAULT_TRAIN_CONFIG, clampCompute, clampTrainConfig } from "./types";
 import * as idb from "./idb";
 
 export type ImageItem = ImageRecord & { url: string };
+
+export type GalleryItem = GalleryRecord & { previewUrl: string };
 
 type KilnState = {
   ready: boolean;
@@ -28,6 +33,11 @@ type KilnState = {
   gpu: GpuInfo | null;
   modelInfo: ModelInfo | null;
   modelStale: boolean;
+  modelReady: boolean;
+  weightsDump: WeightDump | null;
+  proofs: ProofShot[];
+  gallery: GalleryItem[];
+  activeGalleryId: string | null;
   hydrate: () => Promise<void>;
   addImages: (files: { blob: Blob; name: string; caption: string }[]) => Promise<void>;
   setImageCaption: (id: string, caption: string) => Promise<void>;
@@ -42,6 +52,13 @@ type KilnState = {
   setPrep: (done: number, total: number) => void;
   setGpu: (gpu: GpuInfo) => void;
   setModelInfo: (info: ModelInfo | null, stale?: boolean) => Promise<void>;
+  setModelReady: (ready: boolean) => void;
+  setWeightsDump: (dump: WeightDump | null) => Promise<void>;
+  setProofs: (proofs: ProofShot[]) => void;
+  publishModel: (record: GalleryRecord) => Promise<void>;
+  renameGallery: (id: string, name: string) => Promise<void>;
+  removeGallery: (id: string) => Promise<void>;
+  setActiveGalleryId: (id: string | null) => void;
   resetAll: () => Promise<void>;
 };
 
@@ -72,6 +89,11 @@ export const useKiln = create<KilnState>((set, get) => ({
   gpu: null,
   modelInfo: null,
   modelStale: false,
+  modelReady: false,
+  weightsDump: null,
+  proofs: [],
+  gallery: [],
+  activeGalleryId: null,
 
   hydrate: async () => {
     const data = await idb.loadAll();
@@ -79,13 +101,20 @@ export const useKiln = create<KilnState>((set, get) => ({
       ...rec,
       url: data.blobs[rec.id] ? URL.createObjectURL(data.blobs[rec.id]!) : "",
     }));
+    const gallery: GalleryItem[] = data.gallery.map((rec) => ({
+      ...rec,
+      previewUrl: rec.preview ? URL.createObjectURL(rec.preview) : "",
+    }));
     set({
       ready: true,
       images,
       config: data.config,
       compute: data.compute,
       modelInfo: data.modelInfo,
+      weightsDump: data.weights,
       modelStale: false,
+      modelReady: false,
+      gallery,
     });
   },
 
@@ -133,7 +162,7 @@ export const useKiln = create<KilnState>((set, get) => ({
   },
 
   setCompute: async (patch) => {
-    const compute = { ...get().compute, ...patch };
+    const compute = clampCompute({ ...get().compute, ...patch });
     await idb.saveCompute(compute);
     set({ compute });
   },
@@ -142,7 +171,8 @@ export const useKiln = create<KilnState>((set, get) => ({
   setTrainMessage: (trainMessage) => set({ trainMessage }),
   pushLog: (log) => set({ logs: [...get().logs, log] }),
 
-  beginJob: (id) =>
+  beginJob: (id) => {
+    for (const p of get().proofs) revoke(p.url);
     set({
       jobId: id,
       logs: [],
@@ -151,7 +181,10 @@ export const useKiln = create<KilnState>((set, get) => ({
       prepTotal: 0,
       trainMessage: "Job starten…",
       status: "loading",
-    }),
+      modelReady: false,
+      proofs: [],
+    });
+  },
 
   pushConsole: (line) =>
     set({ consoleLines: [...get().consoleLines, line].slice(-80) }),
@@ -164,14 +197,65 @@ export const useKiln = create<KilnState>((set, get) => ({
     set({ modelInfo: info, modelStale: stale });
   },
 
+  setModelReady: (modelReady) => set({ modelReady }),
+
+  setWeightsDump: async (dump) => {
+    await idb.saveWeights(dump);
+    set({ weightsDump: dump });
+  },
+
+  setProofs: (proofs) => {
+    for (const p of get().proofs) revoke(p.url);
+    set({ proofs });
+  },
+
+  publishModel: async (record) => {
+    await idb.saveGallery(record);
+    const previewUrl = record.preview ? URL.createObjectURL(record.preview) : "";
+    const item = { ...record, previewUrl };
+    const rest = get().gallery.filter((g) => g.id !== record.id);
+    for (const old of get().gallery) {
+      if (old.id === record.id && old.previewUrl) revoke(old.previewUrl);
+    }
+    set({ gallery: [item, ...rest], activeGalleryId: record.id });
+  },
+
+  renameGallery: async (id, name) => {
+    const trimmed = name.trim().slice(0, 80);
+    if (!trimmed) return;
+    const found = get().gallery.find((g) => g.id === id);
+    if (!found) return;
+    const next = { ...found, name: trimmed };
+    const { previewUrl: _url, ...record } = next;
+    await idb.saveGallery(record);
+    set({
+      gallery: get().gallery.map((g) => (g.id === id ? { ...g, name: trimmed } : g)),
+    });
+  },
+
+  removeGallery: async (id) => {
+    const found = get().gallery.find((g) => g.id === id);
+    if (found?.previewUrl) revoke(found.previewUrl);
+    await idb.deleteGallery(id);
+    set({
+      gallery: get().gallery.filter((g) => g.id !== id),
+      activeGalleryId: get().activeGalleryId === id ? null : get().activeGalleryId,
+    });
+  },
+
+  setActiveGalleryId: (activeGalleryId) => set({ activeGalleryId }),
+
   resetAll: async () => {
     try {
       const { disposeModel } = await import("./ml/diffusion");
+      const { disposeGan } = await import("./ml/gan");
+      disposeGan();
       await disposeModel();
     } catch {
       /* ignore */
     }
     for (const im of get().images) revoke(im.url);
+    for (const p of get().proofs) revoke(p.url);
     await idb.clearAll();
     set({
       images: [],
@@ -186,6 +270,9 @@ export const useKiln = create<KilnState>((set, get) => ({
       prepTotal: 0,
       modelInfo: null,
       modelStale: false,
+      modelReady: false,
+      weightsDump: null,
+      proofs: [],
     });
   },
 }));

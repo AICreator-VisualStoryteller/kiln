@@ -1,32 +1,43 @@
 import { useKiln } from "@/lib/store";
 import { clampTrainConfig } from "@/lib/types";
-import { blobToRgb } from "./codec.ts";
+import { blobToRgb, imageDataToPngBlob } from "./codec.ts";
 import {
+  hasTrainedModel,
+  importSafetensors,
+  loadSavedModel,
   loadWeights,
+  markUntrained,
   memoryInfo,
   probeGpu,
   resolveRgb,
+  sampleDiffusion,
   stopTraining,
   trainDiffusion,
   type RgbSample,
 } from "./diffusion.ts";
 import { trainOnNode, trainOnRemote } from "./remote.ts";
+import { disposeGan, hasGanModel, loadGanWeights, sampleGan, trainGan } from "./gan.ts";
+import { requestAbort, requestPause, requestResume, resetTrainControl } from "./train-control.ts";
 
 export function trainReadiness(): {
   ok: boolean;
   reason: string | null;
   n: number;
+  labeled: number;
 } {
   const { images } = useKiln.getState();
-  const n = images.filter((im) => im.caption.trim().length > 0 && im.url).length;
+  const usable = images.filter((im) => im.url);
+  const n = usable.length;
+  const labeled = usable.filter((im) => im.caption.trim().length > 0).length;
   if (n < 4) {
     return {
       ok: false,
-      reason: "Voeg minstens vier afbeeldingen mét labels toe.",
+      reason: "Voeg minstens vier afbeeldingen toe. Labels zijn optioneel.",
       n,
+      labeled,
     };
   }
-  return { ok: true, reason: null, n };
+  return { ok: true, reason: null, n, labeled };
 }
 
 async function collectSamples(size: number): Promise<RgbSample[]> {
@@ -34,8 +45,8 @@ async function collectSamples(size: number): Promise<RgbSample[]> {
   const out: RgbSample[] = [];
   const lazy = size >= 256;
   for (const im of images) {
+    if (!im.url) continue;
     const caption = im.caption.trim();
-    if (!caption || !im.url) continue;
     const url = im.url;
     const load = async () => {
       const res = await fetch(url);
@@ -51,28 +62,89 @@ async function collectSamples(size: number): Promise<RgbSample[]> {
   return out;
 }
 
+async function restorePrevious(): Promise<boolean> {
+  const s = useKiln.getState();
+  try {
+    if (s.weightsDump && s.modelInfo) {
+      await loadWeights(s.weightsDump, s.modelInfo.imageSize, s.modelInfo.timesteps);
+      s.setModelReady(true);
+      return true;
+    }
+    if (s.modelInfo) {
+      const ok = await loadSavedModel(s.modelInfo.imageSize, s.modelInfo.timesteps);
+      s.setModelReady(ok);
+      return ok;
+    }
+  } catch {
+    /* ignore */
+  }
+  s.setModelReady(false);
+  return false;
+}
+
+async function makeProofs(captions: string[], arch: "gan" | "diffusion"): Promise<Blob | null> {
+  const can = arch === "gan" ? hasGanModel() : hasTrainedModel();
+  if (!can) return null;
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const c of captions) {
+    const k = c.trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    unique.push(k);
+    if (unique.length >= 8) break;
+  }
+  if (!unique.length) unique.push(arch === "gan" ? "portrait" : "");
+  const shots: { prompt: string; url: string }[] = [];
+  let preview: Blob | null = null;
+  for (const prompt of unique) {
+    const frame =
+      arch === "gan"
+        ? await sampleGan({ prompt })
+        : await sampleDiffusion({ prompt, steps: 8, guidance: 1.8 });
+    const blob = await imageDataToPngBlob(frame);
+    if (!preview) preview = blob;
+    shots.push({ prompt, url: URL.createObjectURL(blob) });
+  }
+  useKiln.getState().setProofs(shots);
+  return preview;
+}
+
 export async function startTrainJob(): Promise<void> {
   const ready = trainReadiness();
   if (!ready.ok) throw new Error(ready.reason ?? "Kan niet trainen");
 
   const store = useKiln.getState();
-  if (store.status === "running" || store.status === "loading") {
+  if (store.status === "running" || store.status === "loading" || store.status === "paused") {
     throw new Error("Er draait al een trainingsjob");
   }
 
   const jobId = `k-${crypto.randomUUID().slice(0, 8)}`;
   store.beginJob(jobId);
+  resetTrainControl();
+  const arch = store.config.arch === "gan" ? "gan" : "diffusion";
+  if (arch === "gan") disposeGan();
+  else markUntrained();
   const config = clampTrainConfig(store.config);
   if (config.batchSize !== store.config.batchSize) {
     await store.setConfig({ batchSize: config.batchSize });
     store.pushConsole(`batch verlaagd naar ${config.batchSize} voor ${config.imageSize}px`);
   }
   const compute = store.compute;
+  const device = compute.device === "cpu" ? "cpu" : "gpu";
   const remoteUrl = compute.remoteUrl.trim();
-  const useRemote = compute.mode === "remote" && remoteUrl.length > 0;
-  const useNode = compute.mode === "node" || (compute.mode === "remote" && !remoteUrl);
-  store.pushConsole(`compute  ${useRemote ? "remote" : useNode ? "gpu-node" : "local"}`);
-  store.pushConsole(`size ${config.imageSize}  T=${config.timesteps}  epochs ${config.epochs}  batch ${config.batchSize}`);
+  const useRemote =
+    arch === "diffusion" && device === "gpu" && compute.mode === "remote" && remoteUrl.length > 0;
+  const useNode =
+    arch === "diffusion" &&
+    device === "gpu" &&
+    (compute.mode === "node" || (compute.mode === "remote" && !remoteUrl));
+  store.pushConsole(
+    `arch  ${arch}  device  ${device}  compute  ${useRemote ? "remote-gpu" : useNode ? "gpu-node" : device === "cpu" ? "local-cpu" : "local-gpu"}`,
+  );
+  store.pushConsole(
+    `size ${config.imageSize}  T=${config.timesteps}  epochs ${config.epochs}  batch ${config.batchSize}  lr ${config.learningRate}`,
+  );
 
   try {
     store.pushConsole("beelden naar RGB tensors…");
@@ -98,7 +170,15 @@ export async function startTrainJob(): Promise<void> {
       useKiln.getState().setPrep(done, total);
     };
 
+    const onPaused = (paused: boolean) => {
+      const s = useKiln.getState();
+      if (s.status === "error" || s.status === "done") return;
+      s.setStatus(paused ? "paused" : "running");
+      s.setTrainMessage(paused ? "Gepauzeerd — hervat wanneer je wilt." : "Training hervat…");
+    };
+
     let info;
+    let weights;
     if (useRemote) {
       const readySamples: RgbSample[] = [];
       for (const s of samples) {
@@ -113,6 +193,7 @@ export async function startTrainJob(): Promise<void> {
         onStatus,
       });
       info = result.info;
+      weights = result.weights;
       await loadWeights(result.weights, config.imageSize, config.timesteps);
     } else if (useNode) {
       const readySamples: RgbSample[] = [];
@@ -125,35 +206,88 @@ export async function startTrainJob(): Promise<void> {
         onStatus,
       });
       info = result.info;
+      weights = result.weights;
       await loadWeights(result.weights, config.imageSize, config.timesteps);
       for (const log of result.logs) onEpoch(log);
+    } else if (arch === "gan") {
+      if (compute.mode !== "local") {
+        store.pushConsole("GAN draait lokaal — de GPU-server is alleen voor diffusion");
+      }
+      const result = await trainGan({
+        samples,
+        config,
+        device,
+        onEpoch,
+        onStatus,
+        onBatch,
+        onPaused,
+      });
+      info = result.info;
+      weights = result.weights;
     } else {
       const result = await trainDiffusion({
         samples,
         config,
+        device,
         onEpoch,
         onStatus,
         onBatch,
+        onPaused,
       });
-      info = { ...result.info, compute: "local" as const };
+      info = { ...result.info, compute: "local" as const, arch: "diffusion" as const };
+      weights = result.weights;
     }
 
+    info = {
+      ...info,
+      arch: info.arch === "gan" ? "gan" : "diffusion",
+    };
+
+    await useKiln.getState().setWeightsDump(weights);
     await useKiln.getState().setModelInfo(info, false);
+    useKiln.getState().setModelReady(true);
     const done = useKiln.getState();
     done.setStatus("done");
-    done.setTrainMessage("Job voltooid — diffusion-gewichten liggen vast.");
+    const drop =
+      info.firstLoss > 0 ? `  ${info.firstLoss.toFixed(3)}→${info.finalLoss.toFixed(3)}` : "";
+    done.setTrainMessage(`Job voltooid — ${info.updates} echte gradient-updates${drop}.`);
     done.pushConsole(
-      `done  loss ${info.finalLoss.toFixed(4)}  ${info.params} params  ${info.backend}`,
+      `done  loss ${info.finalLoss.toFixed(4)}  ${info.params} params  hash ${info.weightHash}  ${info.backend}`,
     );
     try {
       done.setGpu(await probeGpu());
     } catch {
       /* ignore */
     }
+    let preview: Blob | null = null;
+    try {
+      done.setTrainMessage("Eerste samples uit jouw gewichten…");
+      preview = await makeProofs(
+        samples.map((s) => s.caption),
+        info.arch === "gan" ? "gan" : "diffusion",
+      );
+    } catch (err) {
+      done.pushConsole(`proof  ${err instanceof Error ? err.message : "mislukt"}`);
+    }
+    const named =
+      store.config.modelName.trim() ||
+      `${info.arch === "gan" ? "GAN" : "Diffusion"} ${new Date().toLocaleString("nl-NL", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`;
+    await useKiln.getState().publishModel({
+      id: crypto.randomUUID(),
+      name: named,
+      createdAt: Date.now(),
+      arch: info.arch === "gan" ? "gan" : "diffusion",
+      info,
+      weights,
+      preview,
+    });
+    useKiln.getState().pushConsole(`galerij  ${named}`);
+    useKiln.getState().setTrainMessage("Klaar — model staat in de galerij. Je kunt de naam nog wijzigen.");
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Training mislukt";
+    const restored = await restorePrevious();
     useKiln.getState().setStatus("error");
-    useKiln.getState().setTrainMessage(msg);
+    useKiln.getState().setTrainMessage(restored ? `${msg} — vorig model teruggezet` : msg);
     useKiln.getState().pushConsole(`error  ${msg}`);
     throw err;
   }
@@ -161,6 +295,65 @@ export async function startTrainJob(): Promise<void> {
 
 export function requestStop(): void {
   stopTraining();
+  requestAbort();
   useKiln.getState().setTrainMessage("Stoppen na deze batch…");
   useKiln.getState().pushConsole("stop requested");
+}
+
+export function requestPauseTrain(): void {
+  const s = useKiln.getState();
+  if (s.status !== "running" && s.status !== "loading") return;
+  requestPause();
+  s.setStatus("paused");
+  s.setTrainMessage("Pauzeren na deze batch…");
+  s.pushConsole("pause requested");
+}
+
+export function requestResumeTrain(): void {
+  const s = useKiln.getState();
+  if (s.status !== "paused") return;
+  requestResume();
+  s.setStatus("running");
+  s.setTrainMessage("Training hervat…");
+  s.pushConsole("resume");
+}
+
+export async function activateGalleryModel(id: string): Promise<void> {
+  const store = useKiln.getState();
+  if (store.status === "running" || store.status === "loading" || store.status === "paused") {
+    throw new Error("Stop eerst de trainingsjob");
+  }
+  const entry = store.gallery.find((g) => g.id === id);
+  if (!entry) throw new Error("Model niet gevonden");
+  if (entry.arch === "gan") {
+    const { disposeModel } = await import("./diffusion.ts");
+    await disposeModel();
+    await loadGanWeights(entry.weights, entry.info.imageSize);
+  } else {
+    disposeGan();
+    markUntrained();
+    await loadWeights(entry.weights, entry.info.imageSize, entry.info.timesteps || 20);
+  }
+  await store.setWeightsDump(entry.weights);
+  await store.setModelInfo(entry.info, false);
+  store.setModelReady(true);
+  store.setActiveGalleryId(id);
+  store.setTrainMessage(`${entry.name} geladen`);
+}
+
+export async function installImportedModel(file: File) {
+  const store = useKiln.getState();
+  if (store.status === "running" || store.status === "loading") {
+    throw new Error("Stop eerst de trainingsjob");
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const { info, weights } = await importSafetensors(bytes);
+  await store.setWeightsDump(weights);
+  await store.setModelInfo(info, false);
+  store.setModelReady(true);
+  store.pushConsole(
+    `imported  ${info.imageSize}px  T=${info.timesteps}  ${info.params} params  hash ${info.weightHash}`,
+  );
+  store.setTrainMessage(`Model geïmporteerd · ${info.imageSize}px · ${info.params} parameters`);
+  return info;
 }

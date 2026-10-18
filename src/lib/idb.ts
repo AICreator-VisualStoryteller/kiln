@@ -1,8 +1,15 @@
-import type { ComputeSettings, ImageRecord, ModelInfo, TrainConfig } from "./types";
-import { clampTrainConfig, DEFAULT_COMPUTE, DEFAULT_TRAIN_CONFIG } from "./types";
+import type {
+  ComputeSettings,
+  GalleryRecord,
+  ImageRecord,
+  ModelInfo,
+  TrainConfig,
+  WeightDump,
+} from "./types";
+import { clampCompute, clampTrainConfig, DEFAULT_COMPUTE, DEFAULT_TRAIN_CONFIG } from "./types";
 
 const DB_NAME = "kiln";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -17,6 +24,9 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains("meta")) {
         db.createObjectStore("meta");
+      }
+      if (!db.objectStoreNames.contains("gallery")) {
+        db.createObjectStore("gallery", { keyPath: "id" });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -41,18 +51,38 @@ function asImage(raw: ImageRecord & { labelId?: string; caption?: string }): Ima
   };
 }
 
+function asModelInfo(raw: ModelInfo | null | undefined): ModelInfo | null {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    ...raw,
+    firstLoss: Number(raw.firstLoss) || Number(raw.finalLoss) || 0,
+    weightHash: typeof raw.weightHash === "string" ? raw.weightHash : "",
+    updates: Number(raw.updates) || 0,
+    arch: raw.arch === "gan" ? "gan" : "diffusion",
+  };
+}
+
+function asWeights(raw: WeightDump | null | undefined): WeightDump | null {
+  if (!raw || !Array.isArray(raw.shapes) || !Array.isArray(raw.dataB64)) return null;
+  if (raw.shapes.length === 0 || raw.shapes.length !== raw.dataB64.length) return null;
+  return raw;
+}
+
 export async function loadAll(): Promise<{
   images: ImageRecord[];
   blobs: Record<string, Blob>;
   config: TrainConfig;
   compute: ComputeSettings;
   modelInfo: ModelInfo | null;
+  weights: WeightDump | null;
+  gallery: GalleryRecord[];
 }> {
   const db = await openDb();
-  const tx = db.transaction(["images", "blobs", "meta"], "readonly");
+  const tx = db.transaction(["images", "blobs", "meta", "gallery"], "readonly");
   const imagesStore = tx.objectStore("images");
   const blobsStore = tx.objectStore("blobs");
   const metaStore = tx.objectStore("meta");
+  const galleryStore = tx.objectStore("gallery");
 
   const rawImages = await reqToPromise<ImageRecord[]>(imagesStore.getAll());
   const blobKeys = await reqToPromise<IDBValidKey[]>(blobsStore.getAllKeys());
@@ -67,9 +97,13 @@ export async function loadAll(): Promise<{
   const compute =
     (await reqToPromise<ComputeSettings | undefined>(metaStore.get("compute"))) ??
     DEFAULT_COMPUTE;
-  const modelInfo =
-    (await reqToPromise<ModelInfo | null | undefined>(metaStore.get("modelInfo"))) ??
-    null;
+  const modelInfo = asModelInfo(
+    await reqToPromise<ModelInfo | null | undefined>(metaStore.get("modelInfo")),
+  );
+  const weights = asWeights(
+    await reqToPromise<WeightDump | null | undefined>(metaStore.get("weights")),
+  );
+  const galleryRaw = await reqToPromise<GalleryRecord[]>(galleryStore.getAll());
 
   await txDone(tx);
   return {
@@ -79,8 +113,20 @@ export async function loadAll(): Promise<{
       ...DEFAULT_TRAIN_CONFIG,
       ...config,
     }),
-    compute: { ...DEFAULT_COMPUTE, ...compute },
+    compute: clampCompute({ ...DEFAULT_COMPUTE, ...compute }),
     modelInfo,
+    weights,
+    gallery: (galleryRaw ?? [])
+      .filter((g) => g && asWeights(g.weights) && asModelInfo(g.info))
+      .map((g) => ({
+        ...g,
+        info: asModelInfo(g.info)!,
+        weights: asWeights(g.weights)!,
+        arch: g.arch === "gan" ? "gan" : "diffusion",
+        name: typeof g.name === "string" && g.name.trim() ? g.name : "Naamloos model",
+        preview: g.preview instanceof Blob ? g.preview : null,
+      }))
+      .sort((a, b) => b.createdAt - a.createdAt),
   };
 }
 
@@ -102,6 +148,13 @@ export async function saveModelInfo(info: ModelInfo | null): Promise<void> {
   const db = await openDb();
   const tx = db.transaction("meta", "readwrite");
   tx.objectStore("meta").put(info, "modelInfo");
+  await txDone(tx);
+}
+
+export async function saveWeights(dump: WeightDump | null): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction("meta", "readwrite");
+  tx.objectStore("meta").put(dump, "weights");
   await txDone(tx);
 }
 
@@ -131,6 +184,20 @@ export async function updateImage(record: ImageRecord): Promise<void> {
   const db = await openDb();
   const tx = db.transaction("images", "readwrite");
   tx.objectStore("images").put(record);
+  await txDone(tx);
+}
+
+export async function saveGallery(record: GalleryRecord): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction("gallery", "readwrite");
+  tx.objectStore("gallery").put(record);
+  await txDone(tx);
+}
+
+export async function deleteGallery(id: string): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction("gallery", "readwrite");
+  tx.objectStore("gallery").delete(id);
   await txDone(tx);
 }
 

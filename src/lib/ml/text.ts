@@ -1,7 +1,30 @@
 export const MAX_TOKENS = 16;
 export const VOCAB_SIZE = 384;
 
+const FRUIT_ALIAS: Record<string, string> = {
+  a: "fruita",
+  ab: "fruitab",
+  g: "fruitg",
+  gb: "fruitgb",
+  s: "fruits",
+  sb: "fruitsb",
+  p: "fruitp",
+  pb: "fruitpb",
+  c: "fruitc",
+  cb: "fruitcb",
+};
+
 const WORDS = [
+  "fruita",
+  "fruitab",
+  "fruitg",
+  "fruitgb",
+  "fruits",
+  "fruitsb",
+  "fruitp",
+  "fruitpb",
+  "fruitc",
+  "fruitcb",
   "een",
   "a",
   "the",
@@ -105,6 +128,35 @@ const WORDS = [
   "closeup",
   "tabby",
   "calico",
+  "man",
+  "woman",
+  "person",
+  "face",
+  "portrait",
+  "beard",
+  "mustache",
+  "glasses",
+  "hair",
+  "curly",
+  "wavy",
+  "bald",
+  "older",
+  "young",
+  "asian",
+  "latin",
+  "blond",
+  "gray",
+  "bangs",
+  "braids",
+  "locs",
+  "goatee",
+  "freckles",
+  "bob",
+  "afro",
+  "short",
+  "long",
+  "heritage",
+  "mixed",
 ];
 
 const WORD_ID = new Map(WORDS.map((w, i) => [w, i + 1]));
@@ -121,7 +173,11 @@ function hashToken(word: string): number {
 }
 
 export function tokenize(text: string, maxLen = MAX_TOKENS): Int32Array {
-  const norm = text
+  const trimmed = text.trim();
+  const alias = FRUIT_ALIAS[trimmed.toLowerCase()];
+  const source =
+    alias && /^[A-Za-z]{1,3}$/.test(trimmed) ? alias : text;
+  const norm = source
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
