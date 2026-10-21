@@ -16,7 +16,7 @@ type LayersModel = import("@tensorflow/tfjs").LayersModel;
 type SymbolicTensor = import("@tensorflow/tfjs").SymbolicTensor;
 type Tensor = import("@tensorflow/tfjs").Tensor;
 
-const MODEL_KEY = "indexeddb://kiln-ddpm-x0-v3";
+const MODEL_KEY = "indexeddb://kiln-ddpm-eps-v4";
 const T_EMB = 32;
 const COND = 96;
 const UNCOND_P = 0.12;
@@ -134,17 +134,15 @@ function getFilm(tf: Tf, name: string) {
         return (inputShape as number[][])[0];
       }
       call(inputs: Tensor | Tensor[]): Tensor {
-        return tf.tidy(() => {
-          const list = Array.isArray(inputs) ? inputs : [inputs];
-          const x = list[0]!;
-          const gamma = list[1]!;
-          const beta = list[2]!;
-          const bs = x.shape[0] ?? 1;
-          const c = gamma.shape[1] ?? 1;
-          const g = gamma.reshape([bs, 1, 1, c]);
-          const b = beta.reshape([bs, 1, 1, c]);
-          return x.mul(g.add(1)).add(b);
-        });
+        const list = Array.isArray(inputs) ? inputs : [inputs];
+        const x = list[0]!;
+        const gamma = list[1]!;
+        const beta = list[2]!;
+        const bs = x.shape[0] ?? 1;
+        const c = gamma.shape[1] ?? 1;
+        const g = gamma.reshape([bs, 1, 1, c]);
+        const b = beta.reshape([bs, 1, 1, c]);
+        return x.mul(g.add(1)).add(b);
       }
     }
     tf.serialization.registerClass(KilnFilm);
@@ -177,8 +175,26 @@ function addCond(
   _spatial: number,
   name: string,
 ): SymbolicTensor {
-  const gamma = asSym(tf.layers.dense({ units: filters, name: `${name}_gamma` }).apply(cond));
-  const beta = asSym(tf.layers.dense({ units: filters, name: `${name}_beta` }).apply(cond));
+  const gamma = asSym(
+    tf.layers
+      .dense({
+        units: filters,
+        kernelInitializer: "zeros",
+        biasInitializer: "zeros",
+        name: `${name}_gamma`,
+      })
+      .apply(cond),
+  );
+  const beta = asSym(
+    tf.layers
+      .dense({
+        units: filters,
+        kernelInitializer: "zeros",
+        biasInitializer: "zeros",
+        name: `${name}_beta`,
+      })
+      .apply(cond),
+  );
   return asSym(getFilm(tf, `${name}_film`).apply([x, gamma, beta]));
 }
 
@@ -243,14 +259,13 @@ export function buildUnet(tf: Tf, size: number): LayersModel {
         filters: 3,
         kernelSize: 1,
         padding: "same",
-        activation: "tanh",
         kernelInitializer: "glorotNormal",
-        name: "x0",
+        name: "eps",
       })
       .apply(dec1),
   );
 
-  return tf.model({ inputs: [noisy, tembIn, bowIn], outputs: out, name: "kiln_x0" });
+  return tf.model({ inputs: [noisy, tembIn, bowIn], outputs: out, name: "kiln_eps" });
 }
 
 function countParams(m: LayersModel): ModelInfo["layers"] {
@@ -310,6 +325,7 @@ export async function trainDiffusion(opts: {
   onStatus: (msg: string) => void;
   onBatch?: (done: number, total: number) => void;
   onPaused?: (paused: boolean) => void;
+  resume?: WeightDump;
 }): Promise<{ info: ModelInfo; weights: WeightDump }> {
   abortFlag = false;
   resetTrainControl();
@@ -323,7 +339,7 @@ export async function trainDiffusion(opts: {
   timesteps = T;
   const sched = makeSchedule(T);
 
-  opts.onStatus(`backend ${tf.getBackend()} · x0-U-Net ${size}×${size} · T=${T}`);
+  opts.onStatus(`backend ${tf.getBackend()} · eps-U-Net ${size}×${size} · T=${T}`);
 
   if (model) {
     model.dispose();
@@ -334,6 +350,13 @@ export async function trainDiffusion(opts: {
     optimizer: tf.train.adam(config.learningRate),
     loss: "meanSquaredError",
   });
+  if (opts.resume && opts.resume.shapes.length === model.getWeights().length) {
+    const tensors = opts.resume.shapes.map((shape, i) =>
+      tf.tensor(b64ToF32(opts.resume!.dataB64[i]!), shape),
+    );
+    model.setWeights(tensors);
+    tensors.forEach((t) => t.dispose());
+  }
   const net = model;
   const initHash = await weightHashOf(net);
 
@@ -363,6 +386,7 @@ export async function trainDiffusion(opts: {
   let lastLoss = 0;
   let firstLoss = 0;
   let updates = 0;
+  let epochsDone = 0;
   const t0 = performance.now();
   let lastAt = t0;
 
@@ -393,8 +417,7 @@ export async function trainDiffusion(opts: {
           }
           const x0 = tf.tensor4d(xData, [b, size, size, 3]);
           const bow = tf.tensor2d(bowData, [b, VOCAB_SIZE]);
-          const tFloat =
-            Math.random() < 0.55 ? tf.randomUniform([b], T * 0.35, T) : tf.randomUniform([b], 0, T);
+          const tFloat = tf.randomUniform([b], 0, T);
           const tInt = tFloat.floor().toInt();
           tFloat.dispose();
           const ab = tf.gather(alphaBar, tInt).reshape([b, 1, 1, 1]);
@@ -402,7 +425,7 @@ export async function trainDiffusion(opts: {
           const xt = x0.mul(ab.sqrt()).add(noise.mul(tf.sub(1, ab).sqrt()));
           const tEmb = tf.tidy(() => sinusoidT(tf, tInt));
 
-          const out = await net.trainOnBatch([xt, tEmb, bow], x0);
+          const out = await net.trainOnBatch([xt, tEmb, bow], noise);
           const loss = Array.isArray(out) ? Number(out[0]) : Number(out);
           epochLoss += loss;
           stepCount += 1;
@@ -429,8 +452,38 @@ export async function trainDiffusion(opts: {
         seconds: (now - lastAt) / 1000,
       });
       lastAt = now;
+      epochsDone = epoch + 1;
     }
   } catch (err) {
+    const stopped = err instanceof Error && err.message === "Training gestopt";
+    if (stopped && updates > 0 && model) {
+      alphaBar.dispose();
+      cache.clear();
+      const finalHash = await weightHashOf(model);
+      const layers = countParams(model);
+      const params = layers.reduce((s, l) => s + l.params, 0);
+      const weights = await dumpWeights(model);
+      trained = true;
+      const info: ModelInfo = {
+        params,
+        layers,
+        imageSize: size,
+        timesteps: T,
+        trainedAt: Date.now(),
+        finalLoss: lastLoss,
+        firstLoss,
+        backend: tf.getBackend(),
+        epochs: config.epochs,
+        epochsDone,
+        partial: true,
+        sampleCount: n,
+        compute: "local",
+        weightHash: finalHash,
+        updates,
+        arch: "diffusion",
+      };
+      return { info, weights };
+    }
     alphaBar.dispose();
     cache.clear();
     if (model) {
@@ -547,14 +600,14 @@ export function setMeta(size: number, T: number) {
   timesteps = T;
 }
 
-function predictX0(
+function predictEps(
   tf: Tf,
   net: LayersModel,
   x: Tensor,
   t: number,
   bow: Tensor,
   guidance: number,
-): { x0: Tensor; dispose: () => void } {
+): { eps: Tensor; dispose: () => void } {
   const useCfg = guidance > 1.02;
   const tInt = tf.tensor1d(useCfg ? [t, t] : [t], "int32");
   const tEmb = tf.tidy(() => sinusoidT(tf, tInt));
@@ -562,16 +615,17 @@ function predictX0(
   const bowIn = useCfg && zeros ? bow.concat(zeros) : bow;
   const xIn = useCfg ? x.concat(x) : x;
   const pred = net.predict([xIn, tEmb, bowIn]) as Tensor;
-  let x0: Tensor;
+  let eps: Tensor;
   if (useCfg) {
-    x0 = tf.tidy(() => {
+    eps = tf.tidy(() => {
       const parts = tf.split(pred, 2, 0);
-      const mixed = parts[1]!.add(parts[0]!.sub(parts[1]!).mul(guidance));
-      return mixed.clipByValue(-1, 1);
+      const uncond = parts[1]!;
+      const cond = parts[0]!;
+      return uncond.add(cond.sub(uncond).mul(guidance)).clipByValue(-6, 6);
     });
     pred.dispose();
   } else {
-    x0 = pred.clipByValue(-1, 1);
+    eps = pred.clipByValue(-6, 6);
     pred.dispose();
   }
   const extras: Tensor[] = [tInt, tEmb];
@@ -579,7 +633,7 @@ function predictX0(
   if (useCfg && bowIn !== bow) extras.push(bowIn);
   if (useCfg && xIn !== x) extras.push(xIn);
   return {
-    x0,
+    eps,
     dispose: () => extras.forEach((tns) => tns.dispose()),
   };
 }
@@ -605,27 +659,25 @@ export async function sampleDiffusion(opts: {
   const bow = tf.tensor2d(bagOfWords(opts.prompt), [1, VOCAB_SIZE]);
 
   let x: Tensor = tf.randomNormal([1, size, size, 3]);
-  const total = times.length + 1;
+  const total = times.length;
   try {
     for (let i = 0; i < times.length; i++) {
       const t = times[i]!;
       const tPrev = i + 1 < times.length ? times[i + 1]! : -1;
-      const pred = predictX0(tf, net, x, t, bow, guidance);
-      const x0 = pred.x0;
-      const ab = Math.max(sched.alphaBar[t] ?? 0.002, 1e-4);
-      const sqrtAb = Math.sqrt(ab);
-      const sqrtOne = Math.sqrt(Math.max(1 - ab, 1e-4));
-      const next =
-        tPrev < 0
-          ? x0
-          : tf.tidy(() => {
-              const eps = x.sub(x0.mul(sqrtAb)).div(sqrtOne);
-              const abp = Math.max(sched.alphaBar[tPrev] ?? 0.002, 1e-4);
-              return x0.mul(Math.sqrt(abp)).add(eps.mul(Math.sqrt(Math.max(1 - abp, 0))));
-            });
+      const pred = predictEps(tf, net, x, t, bow, guidance);
+      const eps = pred.eps;
+      const ab = Math.max(sched.alphaBar[Math.min(t, T - 1)] ?? 0.002, 1e-4);
+      const abp = tPrev < 0 ? 1 : Math.max(sched.alphaBar[Math.min(tPrev, T - 1)] ?? 0.002, 1e-4);
+      const next = tf.tidy(() => {
+        const sqrtAb = Math.sqrt(ab);
+        const sqrtOne = Math.sqrt(Math.max(1 - ab, 1e-4));
+        const x0 = x.sub(eps.mul(sqrtOne)).div(sqrtAb).clipByValue(-1, 1);
+        if (tPrev < 0) return x0;
+        return x0.mul(Math.sqrt(abp)).add(eps.mul(Math.sqrt(Math.max(1 - abp, 0))));
+      });
       x.dispose();
       pred.dispose();
-      if (tPrev >= 0) x0.dispose();
+      eps.dispose();
       x = next;
 
       if (opts.onStep) {
@@ -636,11 +688,6 @@ export async function sampleDiffusion(opts: {
         if (typeof window !== "undefined") await tf.nextFrame();
       }
     }
-
-    const clean = predictX0(tf, net, x, 0, bow, guidance);
-    x.dispose();
-    x = clean.x0;
-    clean.dispose();
 
     const squeezed = x.squeeze();
     const final = await tensorToImageData(tf, squeezed, size, true);
@@ -697,7 +744,7 @@ export async function exportSafetensors(): Promise<{ bytes: Uint8Array; filename
   const tensors = await collectNamedTensors(model);
   const bytes = encodeSafetensors(tensors, {
     producer: "kiln",
-    arch: "ddpm-x0-unet",
+    arch: "ddpm-eps-unet",
     image_size: String(imageSize),
     timesteps: String(timesteps),
     weight_layout: "tfjs",
@@ -760,7 +807,7 @@ export async function importSafetensors(
     throw new Error("Dit bestand gebruikt een andere gewichten-layout. Kiln laadt alleen zijn eigen export.");
   }
   const arch = (parsed.metadata.arch ?? "").toLowerCase();
-  if (arch && arch !== "ddpm-x0-unet") {
+  if (arch && arch !== "ddpm-eps-unet" && arch !== "ddpm-x0-unet") {
     throw new Error("Dit is geen Kiln DDPM-bestand (arch ontbreekt of klopt niet).");
   }
 

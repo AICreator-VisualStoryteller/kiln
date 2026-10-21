@@ -63,6 +63,9 @@ export type ModelInfo = {
   weightHash: string;
   updates: number;
   arch: ModelArch;
+  /** True while the run was stopped or paused before all epochs. */
+  partial?: boolean;
+  epochsDone?: number;
 };
 
 export type WeightDump = {

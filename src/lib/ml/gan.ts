@@ -136,6 +136,11 @@ async function dumpModel(m: LayersModel): Promise<WeightDump> {
   return { shapes, dataB64 };
 }
 
+export async function snapshotGan(): Promise<WeightDump | null> {
+  if (!generator) return null;
+  return dumpModel(generator);
+}
+
 export function hasGanModel(): boolean {
   return ganReady && generator !== null;
 }
@@ -184,6 +189,7 @@ export async function trainGan(opts: {
   onStatus: (msg: string) => void;
   onBatch?: (done: number, total: number) => void;
   onPaused?: (paused: boolean) => void;
+  resume?: WeightDump;
 }): Promise<{ info: ModelInfo; weights: WeightDump }> {
   resetTrainControl();
   disposeGan();
@@ -211,6 +217,13 @@ export async function trainGan(opts: {
     optimizer: tf.train.adam(lr * 0.4, 0.5, 0.999),
     loss: "binaryCrossentropy",
   });
+  if (opts.resume && opts.resume.shapes.length === gen.getWeights().length) {
+    const tensors = opts.resume.shapes.map((shape, i) =>
+      tf.tensor(b64ToF32(opts.resume!.dataB64[i]!), shape),
+    );
+    gen.setWeights(tensors);
+    tensors.forEach((t) => t.dispose());
+  }
 
   const initHash = await hashOf(gen);
   const batchSize = Math.min(opts.config.batchSize, n);
@@ -218,6 +231,7 @@ export async function trainGan(opts: {
   let lastG = 0;
   let firstG = 0;
   let updates = 0;
+  let epochsDone = 0;
   let lastAt = performance.now();
 
   const cache = new Map<number, Float32Array>();
@@ -281,8 +295,37 @@ export async function trainGan(opts: {
       opts.onEpoch({ epoch: epoch + 1, loss: lastG, seconds: (now - lastAt) / 1000 });
       opts.onStatus(`epoch ${epoch + 1}  G ${lastG.toFixed(3)}  D ${dLoss.toFixed(3)}`);
       lastAt = now;
+      epochsDone = epoch + 1;
     }
   } catch (err) {
+    const stopped = err instanceof Error && err.message === "Training gestopt";
+    if (stopped && updates > 0) {
+      const weights = await dumpModel(gen);
+      const finalHash = await hashOf(gen);
+      gan.dispose();
+      disc.dispose();
+      generator = gen;
+      ganReady = true;
+      const info: ModelInfo = {
+        params: gen.getWeights().reduce((s, w) => s + w.size, 0),
+        layers: [],
+        imageSize: size,
+        timesteps: 0,
+        trainedAt: Date.now(),
+        finalLoss: lastG,
+        firstLoss: firstG,
+        backend: tf.getBackend(),
+        epochs: opts.config.epochs,
+        epochsDone,
+        partial: true,
+        sampleCount: n,
+        compute: "local",
+        weightHash: finalHash,
+        updates,
+        arch: "gan",
+      };
+      return { info, weights };
+    }
     gan.dispose();
     disc.dispose();
     gen.dispose();

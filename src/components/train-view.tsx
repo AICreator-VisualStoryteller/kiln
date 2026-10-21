@@ -37,6 +37,10 @@ export function TrainView() {
   const jobId = useKiln((s) => s.jobId);
   const prepDone = useKiln((s) => s.prepDone);
   const prepTotal = useKiln((s) => s.prepTotal);
+  const eta = useKiln((s) => s.eta);
+  const resumeId = useKiln((s) => s.resumeId);
+  const gallery = useKiln((s) => s.gallery);
+  const resumeItem = gallery.find((g) => g.id === resumeId) ?? null;
   const modelInfo = useKiln((s) => s.modelInfo);
   const modelStale = useKiln((s) => s.modelStale);
   const modelReady = useKiln((s) => s.modelReady);
@@ -68,8 +72,9 @@ export function TrainView() {
   async function onStart() {
     setBusy(true);
     try {
-      await startTrainJob();
-      toast.success("Training voltooid");
+      const result = await startTrainJob(resumeId ? { resumeId } : undefined);
+      useKiln.getState().setResumeId(null);
+      toast.success(result.partial ? "Onaf model staat in de galerij" : "Training voltooid — model staat in de galerij");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Training mislukt");
     } finally {
@@ -133,8 +138,8 @@ export function TrainView() {
         <div>
           <h1 className="text-2xl font-medium tracking-tight">Training</h1>
           <p className="mt-1 max-w-xl text-sm text-muted-foreground">
-            Kies diffusion of een GAN. Beide trainen met echte backpropagation op
-            jouw beelden. Elk afgerond model komt automatisch in de galerij.
+            Kies diffusion of een GAN. Diffusion blijft hetzelfde model. Een gepauzeerd
+            of gestopt model komt vanzelf in de galerij, zodat je later verder traint.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -163,7 +168,7 @@ export function TrainView() {
           ) : (
             <Button onClick={() => void onStart()} disabled={!check.ok || busy}>
               <Zap className="size-4" />
-              {modelInfo ? "Opnieuw trainen" : "Job starten"}
+              {resumeItem ? "Verder trainen" : modelInfo ? "Opnieuw trainen" : "Job starten"}
             </Button>
           )}
           <SafetensorsImport disabled={running || busy} />
@@ -202,6 +207,12 @@ export function TrainView() {
             ? "Conditionele DCGAN: generator maakt beelden, discriminator leert echt van nep. Lokaal, pauzeerbaar."
             : "Conditioneel DDPM. Het U-Net voorspelt het schone beeld. Lokaal pauzeerbaar; GPU-server is diffusion."}
         </p>
+        {resumeItem ? (
+          <p className="text-xs text-muted-foreground">
+            Verder vanaf <span className="text-foreground">{resumeItem.name}</span>
+            {resumeItem.info.partial ? " (onaf)" : ""} · {resumeItem.info.imageSize}px. De job telt de gekozen epochs extra.
+          </p>
+        ) : null}
         <div className="space-y-1.5">
           <p className="text-xs text-muted-foreground">Naam in de galerij</p>
           <Input
@@ -313,7 +324,7 @@ export function TrainView() {
           <div className="flex items-center justify-between gap-3">
             <p className="text-sm text-muted-foreground">{trainMessage}</p>
             <p className="font-mono text-xs tabular-nums text-muted-foreground">
-              {last ? `epoch ${last.epoch}/${config.epochs}` : "voorbereiden"}
+              {eta || (last ? `epoch ${last.epoch}/${config.epochs}` : "ETA na de eerste batch")}
             </p>
           </div>
           <Progress value={progress} />
@@ -667,7 +678,7 @@ function ChipRow({
 }
 
 function ArchitectureTiny() {
-  const layers = ["x", "enc", "down×3", "bot", "up×3", "x0"];
+  const layers = ["x", "enc", "down×3", "bot", "up×3", "eps"];
   return (
     <div className="flex flex-wrap gap-1">
       {layers.map((name) => (

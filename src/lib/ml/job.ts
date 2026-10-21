@@ -13,11 +13,24 @@ import {
   sampleDiffusion,
   stopTraining,
   trainDiffusion,
+  dumpWeights,
   type RgbSample,
 } from "./diffusion.ts";
 import { trainOnNode, trainOnRemote } from "./remote.ts";
-import { disposeGan, hasGanModel, loadGanWeights, sampleGan, trainGan } from "./gan.ts";
+import { disposeGan, hasGanModel, loadGanWeights, sampleGan, snapshotGan, trainGan } from "./gan.ts";
 import { requestAbort, requestPause, requestResume, resetTrainControl } from "./train-control.ts";
+
+function formatEta(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 5) return "nog een paar seconden";
+  if (s < 60) return `nog ~${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m < 60) return `nog ~${m}m ${String(r).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return `nog ~${h}u ${m % 60}m`;
+}
 
 export function trainReadiness(): {
   ok: boolean;
@@ -110,7 +123,7 @@ async function makeProofs(captions: string[], arch: "gan" | "diffusion"): Promis
   return preview;
 }
 
-export async function startTrainJob(): Promise<void> {
+export async function startTrainJob(opts?: { resumeId?: string }): Promise<{ partial: boolean }> {
   const ready = trainReadiness();
   if (!ready.ok) throw new Error(ready.reason ?? "Kan niet trainen");
 
@@ -146,6 +159,20 @@ export async function startTrainJob(): Promise<void> {
     `size ${config.imageSize}  T=${config.timesteps}  epochs ${config.epochs}  batch ${config.batchSize}  lr ${config.learningRate}`,
   );
 
+  let resume: import("@/lib/types").WeightDump | undefined;
+  let galleryId = crypto.randomUUID();
+  if (opts?.resumeId) {
+    const entry = store.gallery.find((g) => g.id === opts.resumeId);
+    if (!entry) throw new Error("Model niet gevonden");
+    if (entry.arch !== arch) throw new Error("Dit model is een andere architectuur");
+    if (entry.info.imageSize !== config.imageSize) {
+      throw new Error("Zet de resolutie gelijk aan het opgeslagen model");
+    }
+    resume = entry.weights;
+    galleryId = entry.id;
+    store.pushConsole(`verder vanaf ${entry.name}`);
+  }
+
   try {
     store.pushConsole("beelden naar RGB tensors…");
     const samples = await collectSamples(config.imageSize);
@@ -166,15 +193,71 @@ export async function startTrainJob(): Promise<void> {
       s.setTrainMessage(msg);
       s.pushConsole(msg);
     };
+    const startedAt = performance.now();
+    let pausedMs = 0;
+    let pauseAt = 0;
     const onBatch = (done: number, total: number) => {
-      useKiln.getState().setPrep(done, total);
+      const now = performance.now();
+      const livePause = pauseAt ? now - pauseAt : 0;
+      const elapsed = Math.max(1, now - startedAt - pausedMs - livePause);
+      const eta = done > 0 ? formatEta(((total - done) * elapsed) / done) : "ETA na de eerste batch";
+      useKiln.getState().setPrep(done, total, eta);
     };
 
     const onPaused = (paused: boolean) => {
       const s = useKiln.getState();
       if (s.status === "error" || s.status === "done") return;
+      if (paused) pauseAt = performance.now();
+      else if (pauseAt) {
+        pausedMs += performance.now() - pauseAt;
+        pauseAt = 0;
+      }
       s.setStatus(paused ? "paused" : "running");
-      s.setTrainMessage(paused ? "Gepauzeerd — hervat wanneer je wilt." : "Training hervat…");
+      s.setTrainMessage(paused ? "Gepauzeerd — checkpoint gaat naar de galerij." : "Training hervat…");
+      if (paused) {
+        void (async () => {
+          try {
+            const weights = arch === "gan" ? await snapshotGan() : await dumpWeights();
+            if (!weights) return;
+            const name =
+              useKiln.getState().config.modelName.trim() ||
+              `${arch === "gan" ? "GAN" : "Diffusion"} ${new Date().toLocaleString("nl-NL", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`;
+            const logs = useKiln.getState().logs;
+            const last = logs[logs.length - 1];
+            await useKiln.getState().publishModel({
+              id: galleryId,
+              name,
+              createdAt: Date.now(),
+              arch,
+              info: {
+                params: 0,
+                layers: [],
+                imageSize: config.imageSize,
+                timesteps: arch === "gan" ? 0 : config.timesteps,
+                trainedAt: Date.now(),
+                finalLoss: last?.loss ?? 0,
+                firstLoss: logs[0]?.loss ?? last?.loss ?? 0,
+                backend: device,
+                epochs: config.epochs,
+                epochsDone: last?.epoch ?? 0,
+                partial: true,
+                sampleCount: samples.length,
+                compute: "local",
+                weightHash: "",
+                updates: last?.epoch ?? 0,
+                arch,
+              },
+              weights,
+              preview: null,
+            });
+            useKiln.getState().pushConsole(`galerij  pauze-checkpoint  ${name}`);
+          } catch (err) {
+            useKiln.getState().pushConsole(
+              `checkpoint  ${err instanceof Error ? err.message : "mislukt"}`,
+            );
+          }
+        })();
+      }
     };
 
     let info;
@@ -221,6 +304,7 @@ export async function startTrainJob(): Promise<void> {
         onStatus,
         onBatch,
         onPaused,
+        resume,
       });
       info = result.info;
       weights = result.weights;
@@ -233,15 +317,14 @@ export async function startTrainJob(): Promise<void> {
         onStatus,
         onBatch,
         onPaused,
+        resume,
       });
       info = { ...result.info, compute: "local" as const, arch: "diffusion" as const };
       weights = result.weights;
     }
 
-    info = {
-      ...info,
-      arch: info.arch === "gan" ? "gan" : "diffusion",
-    };
+    const archFixed: "gan" | "diffusion" = info.arch === "gan" ? "gan" : "diffusion";
+    info = { ...info, arch: archFixed };
 
     await useKiln.getState().setWeightsDump(weights);
     await useKiln.getState().setModelInfo(info, false);
@@ -273,16 +356,21 @@ export async function startTrainJob(): Promise<void> {
       store.config.modelName.trim() ||
       `${info.arch === "gan" ? "GAN" : "Diffusion"} ${new Date().toLocaleString("nl-NL", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`;
     await useKiln.getState().publishModel({
-      id: crypto.randomUUID(),
+      id: galleryId,
       name: named,
       createdAt: Date.now(),
-      arch: info.arch === "gan" ? "gan" : "diffusion",
+      arch: archFixed,
       info,
       weights,
       preview,
     });
     useKiln.getState().pushConsole(`galerij  ${named}`);
-    useKiln.getState().setTrainMessage("Klaar — model staat in de galerij. Je kunt de naam nog wijzigen.");
+    useKiln.getState().setTrainMessage(
+      info.partial
+        ? "Onaf model staat in de galerij — laad het en kies Verder trainen."
+        : "Klaar — model staat in de galerij. Je kunt de naam nog wijzigen.",
+    );
+    return { partial: Boolean(info.partial) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Training mislukt";
     const restored = await restorePrevious();

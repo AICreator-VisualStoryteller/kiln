@@ -122,7 +122,7 @@ export async function loadAll(): Promise<{
         ...g,
         info: asModelInfo(g.info)!,
         weights: asWeights(g.weights)!,
-        arch: g.arch === "gan" ? "gan" : "diffusion",
+        arch: (g.arch === "gan" ? "gan" : "diffusion") as "gan" | "diffusion",
         name: typeof g.name === "string" && g.name.trim() ? g.name : "Naamloos model",
         preview: g.preview instanceof Blob ? g.preview : null,
       }))

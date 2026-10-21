@@ -38,6 +38,7 @@ type KilnState = {
   proofs: ProofShot[];
   gallery: GalleryItem[];
   activeGalleryId: string | null;
+  resumeId: string | null;
   hydrate: () => Promise<void>;
   addImages: (files: { blob: Blob; name: string; caption: string }[]) => Promise<void>;
   setImageCaption: (id: string, caption: string) => Promise<void>;
@@ -59,6 +60,7 @@ type KilnState = {
   renameGallery: (id: string, name: string) => Promise<void>;
   removeGallery: (id: string) => Promise<void>;
   setActiveGalleryId: (id: string | null) => void;
+  setResumeId: (id: string | null) => void;
   resetAll: () => Promise<void>;
 };
 
@@ -72,6 +74,20 @@ function revoke(url: string) {
   } catch {
     /* ignore */
   }
+}
+
+const seenBlobKeys = new Set<string>();
+
+async function blobKey(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let h = 2166136261;
+  const step = Math.max(1, Math.floor(bytes.length / 2048));
+  for (let i = 0; i < bytes.length; i += step) {
+    h ^= bytes[i]!;
+    h = Math.imul(h, 16777619);
+  }
+  h ^= bytes.length;
+  return (h >>> 0).toString(16);
 }
 
 export const useKiln = create<KilnState>((set, get) => ({
@@ -94,13 +110,23 @@ export const useKiln = create<KilnState>((set, get) => ({
   proofs: [],
   gallery: [],
   activeGalleryId: null,
+  resumeId: null,
 
   hydrate: async () => {
     const data = await idb.loadAll();
-    const images: ImageItem[] = data.images.map((rec) => ({
-      ...rec,
-      url: data.blobs[rec.id] ? URL.createObjectURL(data.blobs[rec.id]!) : "",
-    }));
+    seenBlobKeys.clear();
+    const images: ImageItem[] = [];
+    for (const rec of data.images) {
+      const blob = data.blobs[rec.id];
+      if (!blob) continue;
+      const key = await blobKey(blob);
+      if (seenBlobKeys.has(key)) {
+        await idb.deleteImage(rec.id);
+        continue;
+      }
+      seenBlobKeys.add(key);
+      images.push({ ...rec, url: URL.createObjectURL(blob) });
+    }
     const gallery: GalleryItem[] = data.gallery.map((rec) => ({
       ...rec,
       previewUrl: rec.preview ? URL.createObjectURL(rec.preview) : "",
@@ -122,6 +148,9 @@ export const useKiln = create<KilnState>((set, get) => ({
     const items: ImageItem[] = [];
     const packed: { record: ImageRecord; blob: Blob }[] = [];
     for (const file of files) {
+      const key = await blobKey(file.blob);
+      if (seenBlobKeys.has(key)) continue;
+      seenBlobKeys.add(key);
       const record: ImageRecord = {
         id: uid(),
         caption: file.caption,
@@ -131,6 +160,7 @@ export const useKiln = create<KilnState>((set, get) => ({
       packed.push({ record, blob: file.blob });
       items.push({ ...record, url: URL.createObjectURL(file.blob) });
     }
+    if (!packed.length) return;
     await idb.putImages(packed);
     set({
       images: [...get().images, ...items],
@@ -147,7 +177,15 @@ export const useKiln = create<KilnState>((set, get) => ({
 
   removeImage: async (id) => {
     const found = get().images.find((im) => im.id === id);
-    if (found) revoke(found.url);
+    if (found?.url) {
+      try {
+        const res = await fetch(found.url);
+        if (res.ok) seenBlobKeys.delete(await blobKey(await res.blob()));
+      } catch {
+        /* ignore */
+      }
+      revoke(found.url);
+    }
     await idb.deleteImage(id);
     set({
       images: get().images.filter((im) => im.id !== id),
@@ -245,6 +283,8 @@ export const useKiln = create<KilnState>((set, get) => ({
 
   setActiveGalleryId: (activeGalleryId) => set({ activeGalleryId }),
 
+  setResumeId: (resumeId) => set({ resumeId }),
+
   resetAll: async () => {
     try {
       const { disposeModel } = await import("./ml/diffusion");
@@ -257,6 +297,7 @@ export const useKiln = create<KilnState>((set, get) => ({
     for (const im of get().images) revoke(im.url);
     for (const p of get().proofs) revoke(p.url);
     await idb.clearAll();
+    seenBlobKeys.clear();
     set({
       images: [],
       config: DEFAULT_TRAIN_CONFIG,

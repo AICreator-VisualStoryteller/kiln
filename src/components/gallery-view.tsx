@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { useKiln } from "@/lib/store";
+import { asImageSize } from "@/lib/types";
 import { activateGalleryModel } from "@/lib/ml/job";
 
 export function GalleryView() {
@@ -28,9 +29,8 @@ export function GalleryView() {
         <div>
           <h1 className="text-2xl font-medium tracking-tight">Galerij</h1>
           <p className="mt-1 max-w-xl text-sm text-muted-foreground">
-            Elk model dat je hier traint wordt automatisch bewaard. Geef het een
-            naam, laad het terug, of verwijder het. De dataset wissen laat deze
-            galerij staan.
+            Elk model — ook een gepauzeerd of vroeg gestopt model — komt hier automatisch.
+            Geef het een naam. Laden om te genereren, of verder trainen vanaf deze gewichten.
           </p>
         </div>
         <Button asChild variant="secondary">
@@ -72,6 +72,7 @@ export function GalleryView() {
                     {item.arch === "gan" ? "GAN" : "Diffusion"}
                   </Badge>
                   {active ? <Badge variant="success">actief</Badge> : null}
+                  {item.info.partial ? <Badge variant="warning">onaf</Badge> : null}
                   <span className="font-mono text-xs text-muted-foreground">
                     {item.info.imageSize}px · loss {item.info.finalLoss.toFixed(3)}
                   </span>
@@ -105,8 +106,21 @@ export function GalleryView() {
                     <Sparkles className="size-4" />
                     Laden
                   </Button>
-                  <Button asChild size="sm" variant="secondary">
-                    <Link to="/lab">Genereren</Link>
+                  <Button
+                    asChild
+                    size="sm"
+                    variant="secondary"
+                    disabled={busy}
+                    onClick={() => {
+                      void useKiln.getState().setConfig({
+                        arch: item.arch,
+                        imageSize: asImageSize(item.info.imageSize),
+                        timesteps: item.arch === "gan" ? useKiln.getState().config.timesteps : item.info.timesteps || 20,
+                      });
+                      useKiln.getState().setResumeId(item.id);
+                    }}
+                  >
+                    <Link to="/train">Verder</Link>
                   </Button>
                   <Button
                     size="sm"
